@@ -797,6 +797,11 @@ class AIAgent:
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
+        # User-facing /model switches are explicit runtime choices. Fusion's
+        # automatic compaction routing bypasses this wrapper and calls the
+        # helper directly, so marking here suspends only future automatic
+        # routing after a manual override.
+        self._fusion_routing_suspended = True
         from agent.agent_runtime_helpers import switch_model
         return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
 
@@ -3444,6 +3449,17 @@ class AIAgent:
         """
         task_id = getattr(self, "session_id", None) or ""
 
+        closed_sidekick = None
+
+        # 0. Close any persistent Fusion sidekick registered for this parent
+        # session so process/session teardown does not leave a stale child in
+        # the module registry.
+        try:
+            from tools.delegate_tool import close_sidekick_for_session
+            closed_sidekick = close_sidekick_for_session(task_id)
+        except Exception:
+            pass
+
         # 1. Kill background processes for this task
         try:
             from tools.process_registry import process_registry
@@ -3466,8 +3482,12 @@ class AIAgent:
         # 4. Close active child agents
         try:
             with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
+                active_children = getattr(self, "_active_children", [])
+                children = [
+                    child for child in active_children
+                    if closed_sidekick is None or child is not closed_sidekick
+                ]
+                active_children.clear()
             for child in children:
                 try:
                     child.close()
@@ -5550,11 +5570,19 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
+        compressed_messages, new_system_prompt = compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
+        try:
+            from agent.conversation_loop import _apply_fusion_routing_verdict
+            if _apply_fusion_routing_verdict(self):
+                new_system_prompt = self._build_system_prompt(system_message)
+                self._cached_system_prompt = new_system_prompt
+        except Exception:
+            logger.debug("Fusion compaction routing skipped", exc_info=True)
+        return compressed_messages, new_system_prompt
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
@@ -5639,13 +5667,15 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _sidekick_requested = is_truthy_value(function_args.get("sidekick"), default=False)
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(not _is_subagent and not _sidekick_requested),
+            sidekick=_sidekick_requested,
             parent_agent=self,
         )
 
