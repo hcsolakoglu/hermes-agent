@@ -156,6 +156,77 @@ def _ra():
     return run_agent
 
 
+def _apply_fusion_routing_verdict(agent: Any) -> bool:
+    """Consume a compaction-time Fusion verdict and switch route if needed.
+
+    Returns True only when a switch_model call succeeded. The verdict is always
+    cleared, so a failed or skipped compaction cannot leak stale routing into a
+    later boundary.
+    """
+    if not (
+        getattr(agent, "_fusion_enabled", False)
+        and getattr(agent, "_fusion_compaction_routing", False)
+    ):
+        return False
+
+    verdict = getattr(agent, "_fusion_routing_verdict", None)
+    agent._fusion_routing_verdict = None
+    if not verdict or getattr(agent, "_fusion_routing_suspended", False):
+        return False
+
+    verdict = str(verdict).strip().upper()
+    if verdict == "MECHANICAL":
+        runtime = getattr(agent, "_fusion_routing_runtime", {}) or {}
+    elif verdict == "FRONTIER_JUDGMENT":
+        runtime = getattr(agent, "_fusion_frontier_runtime", {}) or {}
+    else:
+        return False
+
+    target_model = str(runtime.get("model") or "").strip()
+    if not target_model:
+        return False
+    target_provider = str(runtime.get("provider") or getattr(agent, "provider", "") or "").strip()
+    target_base_url = str(runtime.get("base_url") or "").strip()
+    target_api_mode = str(runtime.get("api_mode") or "").strip()
+    target_api_key = runtime.get("api_key") or ""
+    current_provider = str(getattr(agent, "provider", "") or "").strip()
+    if target_provider and target_provider != current_provider and (
+        not target_api_key or not target_base_url
+    ):
+        logger.warning(
+            "Fusion compaction routing skipped: routing provider %s needs explicit "
+            "credentials and endpoint; set fusion.routing_api_key/routing_base_url "
+            "or fusion.sidekick_api_key/sidekick_base_url to avoid inheriting the current runtime",
+            target_provider,
+        )
+        return False
+
+    if (
+        target_model == getattr(agent, "model", "")
+        and target_provider == getattr(agent, "provider", "")
+        and target_base_url == getattr(agent, "base_url", "")
+        and target_api_mode == getattr(agent, "api_mode", "")
+    ):
+        return False
+
+    try:
+        from agent import agent_runtime_helpers
+
+        return bool(
+            agent_runtime_helpers.switch_model(
+                agent,
+                target_model,
+                target_provider,
+                api_key=target_api_key,
+                base_url=target_base_url,
+                api_mode=target_api_mode,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Fusion compaction routing switch skipped: %s", exc)
+        return False
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
